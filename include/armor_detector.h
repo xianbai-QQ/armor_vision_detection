@@ -82,18 +82,41 @@ enum class ArmorColor
 // 下面的默认值不是猜的，是按 images/outpost_frame.png 实测出来的尺寸定的。
 struct DetectorParams
 {
+    // ---- 颜色分割 ----
+    // 目标灯条是橙色的。H 8~40 是实测 25~33 两边留余量，S、V 下限用来排除
+    // 画面下方那两块「很亮但几乎没颜色」的白色灯板。
+    HsvRange target_range{8, 100, 150, 40, 255, 255};
+    ArmorColor target_color = ArmorColor::Orange;
+
+    int blur_kernel = 3;      // 中值滤波核，0 = 不滤波
+    int morph_kernel = 3;     // 形态学核大小，越大清理越狠，也越容易把灯条吃掉
+
     // ---- 灯条筛选 ----
-    int min_light_area = 100;       // 清理后 mask 上的灯条面积约 106~156
+    int min_light_area = 100;       // 清理后 mask 上的灯条面积实测 120~159
     int max_light_area = 400;
-    float min_light_aspect = 2.5f;  // 长边/短边，实测 29/8≈3.6、23/6≈3.8
+    float min_light_aspect = 2.5f;  // 长边/短边，实测 30/7≈4.3、27/5≈5.4
     float max_light_aspect = 8.0f;
 
     // ---- 灯条配对 ----
-    float max_length_ratio = 1.6f;     // 两灯条长度比上限，实测 29/23≈1.26
-    float max_angle_diff = 15.0f;      // 两根灯条的倾角差上限（度）
-    float max_center_dy_ratio = 0.6f;  // 上下偏差 / 平均长度，实测 8/26≈0.31
-    float min_spacing_ratio = 1.2f;    // 水平间距 / 平均长度，实测 78/26≈3.0
+    float max_length_ratio = 1.6f;     // 两灯条长度比上限，实测 30/27≈1.11
+    float max_angle_diff = 15.0f;      // 两根灯条方向向量夹角上限（度）
+    float min_spacing_ratio = 1.2f;    // 水平间距 / 平均长度，实测 77/28.5≈2.7
     float max_spacing_ratio = 5.0f;
+
+    // 「两根灯条中心的上下偏差」不用 dy/灯条长度 来判断，而是看两个角度：
+    //   max_baseline_tilt  左右灯条中心连线（基线）最多允许倾斜多少度；
+    //   max_perp_error     基线方向和灯条方向必须接近垂直，允许的偏差角度。
+    // 原来的 dy/长度 在整块装甲板倾斜时会被放大（同一块装甲板旋转 20° 就判不出来），
+    // 换成角度以后只和几何形状有关，和图像尺寸、装甲板是否倾斜都无关。
+    // 主图实测：基线倾角 6.3°，基线与灯条方向夹角 96.3°（偏差 6.3°）。
+    float max_baseline_tilt = 40.0f;
+    float max_perp_error = 20.0f;
+
+    // ---- 装甲板整体比例 ----
+    // 四角点算出来的「宽 / 高」。实测 83/28.5≈2.9，太扁（两根灯条离太远）
+    // 或太方（不是一块装甲板）的组合在这里被拒掉。
+    float min_armor_aspect = 1.2f;
+    float max_armor_aspect = 6.0f;
 };
 
 // 一根灯条的候选（第三步配对要用）
@@ -103,19 +126,35 @@ struct LightBar
     cv::Point2f center;         // 中心点
     float length = 0.0f;        // 长边
     float width = 0.0f;         // 短边
-    float angle = 0.0f;         // 倾斜角（度）
+    float angle = 0.0f;         // 倾斜角（度）：0 = 完全竖直
     ArmorColor color = ArmorColor::Unknown;   // 这根灯条属于哪种颜色
 };
 
 // 一块装甲板的结果
 struct Armor
 {
-    std::array<cv::Point2f, 4> corners{};  // 顺序固定：左上 -> 右上 -> 右下 -> 左下
+    // 四角点顺序固定：左上 -> 右上 -> 右下 -> 左下（图像坐标，y 向下，是顺时针绕向）。
+    // 这个顺序是下一阶段 solvePnP 的输入约定，不能随便换。
+    std::array<cv::Point2f, 4> corners{};
     cv::Rect bound_rect;                   // 外接框
-    cv::Point2f center;                    // 中心点
+    cv::Point2f center;                    // 中心点（四个角点的平均）
+    float width = 0.0f;                    // 上/下两条边的平均长度
+    float height = 0.0f;                   // 左/右两条边的平均长度
     int number = -1;                       // 装甲板数字，还没识别就是 -1
     bool valid = false;                    // 这个结果是否有效
     ArmorColor color = ArmorColor::Unknown;
+    int left_bar = -1;                     // 组成它的左灯条在 LightBar 列表里的编号
+    int right_bar = -1;                    // 右灯条编号
+};
+
+// 单帧检测的完整输出：装甲板 + 中间结果（方便存 mask、画候选图、排错）。
+// 下一阶段接视频时，每帧调用一次 Detect，只取 armors 用即可。
+struct DetectResult
+{
+    std::vector<Armor> armors;          // 最终装甲板候选，可能为空
+    std::vector<LightBar> light_bars;   // 通过筛选的灯条候选
+    cv::Mat color_mask;                 // 颜色分割后的原始 mask
+    cv::Mat cleaned_mask;               // 形态学清理后的 mask
 };
 
 // ===========================================================================
@@ -129,7 +168,8 @@ std::vector<LightBar> FindLightBars(const cv::Mat& mask,
                                     ArmorColor color = ArmorColor::Unknown);
 
 // 把灯条两两配对成装甲板候选。
-// 只有同时满足颜色一致、长度相近、倾角相近、上下对齐、间距合理的一对才会保留。
+// 只有同时满足颜色一致、长度相近、倾角相近、上下对齐、间距合理、
+// 整体宽高比合理的组合才会保留；同一块装甲板被重复配对时只留一个。
 std::vector<Armor> MatchArmors(const std::vector<LightBar>& bars,
                                const DetectorParams& params);
 
@@ -138,8 +178,9 @@ class ArmorDetector
 public:
     explicit ArmorDetector(DetectorParams params = {});
 
-    // 输入一张彩色图，返回检测到的装甲板（可能 0 块、1 块、多块）
-    std::vector<Armor> Detect(const cv::Mat& img) const;
+    // 输入一张彩色图，返回全部检测结果，包括中间 mask。
+    // 传空图、非 3/4 通道图时返回空结果，不会抛异常。
+    DetectResult Detect(const cv::Mat& img) const;
 
 private:
     DetectorParams params_;

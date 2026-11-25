@@ -1,4 +1,7 @@
 #include "armor_detector.h"
+#include "pose_solver.h"
+#include "validation.h"
+#include "video_pipeline.h"
 
 #include <chrono>
 #include <cmath>
@@ -10,6 +13,171 @@
 #include <vector>
 
 namespace {
+
+// ===========================================================================
+//  命令行
+// ===========================================================================
+
+struct CommandLine
+{
+    enum class Mode
+    {
+        Image,      // 第一阶段：静态图片回归入口
+        Video,      // 第二阶段：逐帧检测 + 位姿解算 + 结果视频
+        Validate,   // 第二阶段：Z_rough 核对 + 单因素敏感性分析
+        Help
+    };
+
+    Mode mode = Mode::Image;
+    std::string input = "images/outpost_frame.png";
+    bool mode_explicit = false;
+
+    // 视频模式的输出路径，留空则用默认值
+    std::string out_video;
+    std::string csv;
+    std::string snapshot_dir;
+    std::string validation_md;
+
+    std::string calib = "doc";   // doc | params
+    std::string detector = "video";  // video | default
+    int max_frames = 0;
+    std::string codec;           // 覆盖默认编码候选
+};
+
+void PrintUsage(const char* program)
+{
+    std::cout
+        << "用法:\n"
+        << "  " << program << " <图片路径>                  # 第一阶段静态图检测（默认）\n"
+        << "  " << program << " --image <图片路径>          # 同上\n"
+        << "  " << program << " --video <视频路径>          # 逐帧检测 + 位姿解算 + 结果视频\n"
+        << "  " << program << " --validate <视频路径>       # 粗略深度核对 + 敏感性分析\n"
+        << "\n"
+        << "通用选项:\n"
+        << "  --calib doc|params  相机参数来源（默认 doc = 姿态解算.md 表格）\n"
+        << "  --detector video|default  视频用哪套检测阈值（默认 video = 暗光放宽版）\n"
+        << "  --out <路径>        结果视频路径（默认 output/pose/outpost_pose.avi）\n"
+        << "  --csv <路径>        逐帧数据路径（默认 output/pose/frames.csv）\n"
+        << "  --snapshots <目录>  验证图目录（默认 output/pose/validation）\n"
+        << "  --md <路径>         验证报告路径（默认 output/pose/validation.md）\n"
+        << "  --codec <FOURCC>    结果视频编码（默认依次尝试 H264/XVID/MJPG）\n"
+        << "  --max-frames N      只处理前 N 帧（0 = 全部，用于冒烟测试）\n"
+        << "\n"
+        << "示例:\n"
+        << "  " << program << " images/outpost_frame.png\n"
+        << "  " << program << " --video outpost.avi\n"
+        << "  " << program << " --video outpost.avi --calib params --max-frames 300\n";
+}
+
+// 判断字符串是不是“像视频”的扩展名，用于单参数时的模式推断。
+bool LooksLikeVideo(const std::string& path)
+{
+    const std::size_t pos = path.find_last_of('.');
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+    std::string ext = path.substr(pos);
+    for (char& c : ext)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return ext == ".avi" || ext == ".mp4" || ext == ".mkv" || ext == ".mov";
+}
+
+bool ParseArgs(int argc, char** argv, CommandLine* cli)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg = argv[i];
+        auto next = [&](std::string* out) {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "选项 " << arg << " 缺少参数\n";
+                return false;
+            }
+            *out = argv[++i];
+            return true;
+        };
+
+        if (arg == "--help" || arg == "-h")
+        {
+            cli->mode = CommandLine::Mode::Help;
+            return true;
+        }
+        else if (arg == "--image")
+        {
+            cli->mode = CommandLine::Mode::Image;
+            cli->mode_explicit = true;
+            if (!next(&cli->input)) return false;
+        }
+        else if (arg == "--video")
+        {
+            cli->mode = CommandLine::Mode::Video;
+            cli->mode_explicit = true;
+            if (!next(&cli->input)) return false;
+        }
+        else if (arg == "--validate")
+        {
+            cli->mode = CommandLine::Mode::Validate;
+            cli->mode_explicit = true;
+            if (!next(&cli->input)) return false;
+        }
+        else if (arg == "--calib")
+        {
+            if (!next(&cli->calib)) return false;
+        }
+        else if (arg == "--detector")
+        {
+            if (!next(&cli->detector)) return false;
+        }
+        else if (arg == "--out")
+        {
+            if (!next(&cli->out_video)) return false;
+        }
+        else if (arg == "--csv")
+        {
+            if (!next(&cli->csv)) return false;
+        }
+        else if (arg == "--snapshots")
+        {
+            if (!next(&cli->snapshot_dir)) return false;
+        }
+        else if (arg == "--md")
+        {
+            if (!next(&cli->validation_md)) return false;
+        }
+        else if (arg == "--codec")
+        {
+            if (!next(&cli->codec)) return false;
+        }
+        else if (arg == "--max-frames")
+        {
+            std::string value;
+            if (!next(&value)) return false;
+            cli->max_frames = std::max(0, std::atoi(value.c_str()));
+        }
+        else if (!arg.empty() && arg[0] == '-')
+        {
+            std::cerr << "未知选项：" << arg << "\n";
+            return false;
+        }
+        else
+        {
+            cli->input = arg;
+            if (!cli->mode_explicit)
+            {
+                cli->mode = LooksLikeVideo(arg) ? CommandLine::Mode::Video
+                                                : CommandLine::Mode::Image;
+            }
+        }
+    }
+    return true;
+}
+
+// ===========================================================================
+//  第一阶段：静态图片
+// ===========================================================================
 
 // 点坐标转字符串，统一保留一位小数，打印和写报告都用它
 std::string PointToString(const cv::Point2f& point)
@@ -140,31 +308,23 @@ void SaveArmorZoom(const cv::Mat& result, const armor_vision::Armor& armor,
     armor_vision::SaveImage(zoom, path);
 }
 
-}  // namespace
-
-int main(int argc, char** argv)
+int RunImageMode(const std::string& path)
 {
-    if (argc != 2)
-    {
-        std::cerr << "用法: " << argv[0] << " images/outpost_frame.png\n";
-        return -1;
-    }
-
     // ---------------------------------------------------------------------
     //  读图 + 检查
     //  imread 读不到文件时不会抛异常，只会返回空的 Mat，所以必须自己检查。
     // ---------------------------------------------------------------------
-    cv::Mat img = cv::imread(argv[1], cv::IMREAD_COLOR);
+    cv::Mat img = cv::imread(path, cv::IMREAD_COLOR);
     if (img.empty())
     {
-        std::cerr << "读取图片失败：" << argv[1] << "\n";
+        std::cerr << "读取图片失败：" << path << "\n";
         return -1;
     }
 
     // 终端和 output/report.txt 输出同一份内容，这里先把报告攒起来
     std::ostringstream report;
     report << "装甲板检测报告\n"
-           << "图片: " << argv[1] << "\n"
+           << "图片: " << path << "\n"
            << "尺寸: " << img.cols << " x " << img.rows
            << "  通道数: " << img.channels() << "\n";
 
@@ -280,4 +440,108 @@ int main(int argc, char** argv)
     }
 
     return saved ? 0 : -1;
+}
+
+// ===========================================================================
+//  第二阶段：视频 / 验证
+// ===========================================================================
+
+// 视频模式下选哪一套检测阈值：默认暗光放宽版；`default` 用第一阶段原阈值，
+// 只用于对比“放宽前后”的检出差异。
+armor_vision::DetectorParams PickDetector(const std::string& name)
+{
+    if (name == "default")
+    {
+        return armor_vision::DetectorParams{};
+    }
+    if (name != "video")
+    {
+        std::cerr << "未知的 --detector 取值：" << name << "（可用 video / default）\n";
+    }
+    return armor_vision::VideoDetectorParams();
+}
+
+armor_vision::CameraIntrinsics PickCamera(const std::string& name)
+{
+    if (name == "params")
+    {
+        return armor_vision::CameraIntrinsics::FromParamsMd();
+    }
+    if (name != "doc")
+    {
+        std::cerr << "未知的 --calib 取值：" << name << "（可用 doc / params）\n";
+    }
+    return armor_vision::CameraIntrinsics::FromTaskDoc();
+}
+
+int RunVideoMode(const CommandLine& cli)
+{
+    armor_vision::PoseRunOptions options;
+    options.video_path = cli.input;
+    options.camera = PickCamera(cli.calib);
+    options.detector = PickDetector(cli.detector);
+    options.max_frames = cli.max_frames;
+    if (!cli.out_video.empty()) options.out_video_path = cli.out_video;
+    if (!cli.csv.empty()) options.csv_path = cli.csv;
+    if (!cli.snapshot_dir.empty()) options.snapshot_dir = cli.snapshot_dir;
+    if (!cli.codec.empty())
+    {
+        options.codecs = {cli.codec};
+    }
+
+    const armor_vision::PoseRunStats stats = armor_vision::RunPoseVideo(options);
+    if (!stats.ok)
+    {
+        std::cerr << "视频流水线失败：" << stats.error << "\n";
+        return -1;
+    }
+    return 0;
+}
+
+int RunValidateMode(const CommandLine& cli)
+{
+    armor_vision::ValidationOptions options;
+    options.video_path = cli.input;
+    options.camera = PickCamera(cli.calib);
+    options.detector = PickDetector(cli.detector);
+    if (!cli.validation_md.empty()) options.out_md = cli.validation_md;
+
+    const armor_vision::ValidationStats stats = armor_vision::RunValidation(options);
+    if (!stats.ok)
+    {
+        std::cerr << "验证失败：" << stats.error << "\n";
+        return -1;
+    }
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv)
+{
+    CommandLine cli;
+    if (argc == 1)
+    {
+        // 保持最朴素的行为不变：不带参数就按第一阶段的方式跑默认图片。
+        std::cout << "未提供参数，使用默认静态图片：" << cli.input << "\n\n";
+    }
+    if (!ParseArgs(argc, argv, &cli))
+    {
+        PrintUsage(argv[0]);
+        return -1;
+    }
+
+    switch (cli.mode)
+    {
+        case CommandLine::Mode::Help:
+            PrintUsage(argv[0]);
+            return 0;
+        case CommandLine::Mode::Image:
+            return RunImageMode(cli.input);
+        case CommandLine::Mode::Video:
+            return RunVideoMode(cli);
+        case CommandLine::Mode::Validate:
+            return RunValidateMode(cli);
+    }
+    return -1;
 }

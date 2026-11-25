@@ -8,3 +8,12 @@
 
 # 系统文件
 .DS_Store
+
+# 第二阶段的输入视频（约 15 MB，属于任务输入、可由使用者自行放置，不入库）
+outpost.avi
+Video_*.avi
+/videos/
+
+# 调参与临时探针产物
+output/probe/
+

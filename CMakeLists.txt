@@ -25,6 +25,10 @@ add_executable(armor_vision_detect
     src/hsv_processor.cpp
     src/morphology_processor.cpp
     src/utils.cpp
+    # 第二阶段：位姿解算与视频流水线
+    src/pose_solver.cpp
+    src/video_pipeline.cpp
+    src/validation.cpp
 )
 
 # 6. 头文件搜索路径（等价于编译时的 -I 参数）。

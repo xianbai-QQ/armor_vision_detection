@@ -37,12 +37,23 @@ mkdir -p build && cd build && cmake .. && make && cd ..
 ## 二、运行
 
 ```bash
+# 第一阶段：静态图片检测（不带参数时默认跑 images/outpost_frame.png）
 ./build/armor_vision_detect images/outpost_frame.png
+
+# 第二阶段：视频逐帧检测 + 位姿解算（结果视频 / CSV / 验证图）
+./build/armor_vision_detect --video outpost.avi
+
+# 第二阶段：粗略深度核对 + 单因素敏感性分析
+./build/armor_vision_detect --validate outpost.avi
 ```
 
-- 不传参数：打印用法并返回 `-1`；
+第二阶段的完整说明、相机参数、坐标约定、测试记录见 [POSE.md](POSE.md)。
+
+- 不传参数：按第一阶段的方式跑默认图片 `images/outpost_frame.png`；
 - 图片路径不存在或不是图片：打印「读取图片失败」并返回 `-1`；
-- 图片能读但没有候选：打印「没有检测到装甲板」，**正常返回 0**（不是崩溃）。
+- 图片能读但没有候选：打印「没有检测到装甲板」，**正常返回 0**（不是崩溃）；
+- 视频路径不存在：打印「打开视频失败」并返回 `-1`；
+- 视频能读但整段没有候选：结果视频照常写出（每帧标 `no candidate`），退出码 0。
 
 ## 三、目录结构
 
@@ -50,17 +61,24 @@ mkdir -p build && cd build && cmake .. && make && cd ..
 armor_vision_detect/
 ├── CMakeLists.txt
 ├── include/
-│   └── armor_detector.h        # 参数、数据结构、类和函数的声明
+│   ├── armor_detector.h        # 参数、数据结构、类和函数的声明
+│   ├── pose_solver.h           # 相机内参、装甲板模型、PnP 位姿结果
+│   ├── video_pipeline.h        # 视频逐帧检测 + 位姿解算的参数与入口
+│   └── validation.h            # 深度核对与敏感性实验
 ├── src/
-│   ├── main.cpp                # 读图、调用单帧接口、画图、打印/写报告
+│   ├── main.cpp                # 命令行分发 + 第一阶段读图/画图/写报告
 │   ├── armor_detector.cpp      # 检测总流程 + 灯条筛选 + 配对 + 四角点
 │   ├── hsv_processor.cpp       # BGR → HSV → inRange → mask
 │   ├── morphology_processor.cpp# 腐蚀/膨胀/开/闭
-│   └── utils.cpp               # SaveImage、颜色名
+│   ├── utils.cpp               # SaveImage、颜色名
+│   ├── pose_solver.cpp         # solvePnP / projectPoints / 重投影误差
+│   ├── video_pipeline.cpp      # 读视频、逐帧解算、写标注视频与 CSV
+│   └── validation.cpp          # Z_rough 对比 + 单因素扰动实验
 ├── images/
-│   └── outpost_frame.png       # 本阶段验收输入（1280×1024，3 通道）
+│   └── outpost_frame.png       # 第一阶段验收输入（1280×1024，3 通道）
 ├── test_images/                # 自测用图（翻转、裁剪、旋转、全黑）
 ├── output/                     # 程序生成的 mask、候选图、结果图和报告
+├── output/pose/                # 第二阶段结果视频、CSV、验证图、验证报告
 └── build/                      # 编译产物，可删除重编
 ```
 
@@ -311,8 +329,8 @@ while (capture.read(frame))
 - **数字未识别**：`Armor::number` 固定为 -1，留待下一阶段做数字分类。
 - **没有时序信息**：每帧独立检测，没有跟踪和预测；误检只能靠单帧几何条件压制。
 - **大角度倾斜不支持**：灯条筛选要求外接框高 > 宽，装甲板旋转超过约 40~45° 会检测不到。
-- **下一阶段**：接视频逐帧调用 `Detect()`，用 `Armor::corners`（左上→右上→右下→左下）做 `solvePnP`，
-  再加 ROI 和跟踪。
+- **下一阶段**：第二阶段已完成，见 [POSE.md](POSE.md)——视频逐帧检测、`solvePnP` 位姿解算、
+  重投影校验、`Z_rough` 深度核对与敏感性分析。仍未做的：跨帧跟踪与预测、数字识别。
 
 ## 十、提交内容对照
 

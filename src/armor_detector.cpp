@@ -148,6 +148,16 @@ std::array<cv::Point2f, 4> ComputeCorners(const LightBar& left, const LightBar& 
 
 }  // namespace
 
+DetectorParams VideoDetectorParams()
+{
+    DetectorParams params;
+    // 颜色：H 仍然是 8~40（视频里灯条实测中位数 H≈22），S/V 下限放松。
+    params.target_range = HsvRange{8, 50, 80, 40, 255, 255};
+    // 面积：暗光下灯条只剩几十像素，原来的 100 会把整根灯条判成噪点。
+    params.min_light_area = 40;
+    return params;
+}
+
 std::vector<LightBar> FindLightBars(const cv::Mat& mask,
                                     const DetectorParams& params,
                                     ArmorColor color)
